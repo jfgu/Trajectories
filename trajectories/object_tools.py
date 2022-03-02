@@ -181,3 +181,192 @@ def unsplit_objects(trajectory, labels, nobjects, nx, ny) :
                     trajectory[it,labels == iobj,:])
 
     return trajectory
+
+def _test_indices_3d(i, j, k, k_limit, k_start, diagonal=False):
+    """
+    Find the indices of neighbouring grid boxes for a specified grid box.
+
+    Args:
+        i,j,k      : x-, y-, z- indices of a specified grid box
+        k_limit    : the lower bound of z-direction 
+        k_start    : the upper bound of z-direction
+        diagonal   : whether to treat the diagonal grid cells as neighbours
+
+    Returns
+    -------
+        indices of neighbouring grid boxes.
+
+    @author: Jian-Feng Gu
+
+    """
+
+    # Standard, cells sharing a border are adjacent.
+    if k > k_start and k < k_limit:
+       indices = [(i-1, j, k), (i+1, j, k), (i, j-1, k), (i, j+1, k), (i, j, k-1), (i, j, k+1)]
+       if diagonal:
+           # Diagonal cells considered adjacent.
+           indices += [(i-1, j-1, k), (i-1, j+1, k), (i+1, j-1, k), (i+1, j+1, k), (i-1, j, k-1), (i+1, j, k-1), (i, j-1, k-1), (i, j+1, k-1), (i-1, j, k+1), (i+1, j, k+1), (i, j-1, k+1), (i, j+1, k+1)]
+
+    elif k <= k_start:
+       indices = [(i-1, j, k), (i+1, j, k), (i, j-1, k), (i, j+1, k), (i, j, k+1)]
+       if diagonal:
+           # Diagonal cells considered adjacent.
+           indices += [(i-1, j-1, k), (i-1, j+1, k), (i+1, j-1, k), (i+1, j+1, k), (i-1, j, k+1), (i+1, j, k+1), (i, j-1, k+1), (i, j+1, k+1)]
+
+    elif k >= k_limit:
+       indices = [(i-1, j, k), (i+1, j, k), (i, j-1, k), (i, j+1, k), (i, j, k-1)]
+       if diagonal:
+           # Diagonal cells considered adjacent.
+           indices += [(i-1, j-1, k), (i-1, j+1, k), (i+1, j-1, k), (i+1, j+1, k), (i-1, j, k-1), (i+1, j, k-1), (i, j-1, k-1), (i, j+1, k-1)]
+
+    return indices
+
+def label_clds_3d(mask, diagonal=False, wrap=True, min_cells=0, k_start=1):
+    """
+    Label 3D contiguous objects.
+
+    Args:
+        mask      : 3D mask of True/False representing objects.
+        diagonal  : Whether to treat diagonal grid boxes as contiguous.
+        wrap      : Whether to wrap on edge.
+        min_cells : Minimum number of grid-boxes to include in an object.
+
+    Return:
+    -------
+        tuple(int, np.ndarray): max_label and 3D array of object labels.
+
+    @author Jian-Feng Gu
+    """
+
+    labels = np.zeros_like(mask, dtype=np.int32)
+    max_label = 0
+    acceptable_blobs = []
+    for k in range(k_start, mask.shape[2]-1):
+        for j in range(mask.shape[1]):
+            for i in range(mask.shape[0]):
+                if labels[i, j, k]:
+                    continue
+
+                if mask[i, j, k]:
+                    blob_count = 1
+                    max_label += 1
+                    labels[i, j, k] = max_label
+                    outers = [(i, j, k)]
+                    while outers:
+                        new_outers = []
+                        for ii, jj, kk in outers:
+                            for it, jt, kt in _test_indices_3d(ii, jj, kk, mask.shape[2]-1, k_start, diagonal):
+                                if not wrap:
+                                    if it < 0 or it >= mask.shape[0] or \
+                                                    jt < 0 or jt >= mask.shape[1]:
+                                        continue
+                                else:
+                                    it %= mask.shape[0]
+                                    jt %= mask.shape[1]
+
+                                if kt >= mask.shape[2] or kt < k_start:
+                                   print(kt, 'out of range of vertical domain')
+
+                                if not labels[it, jt, kt] and mask[it, jt, kt]:
+                                    blob_count += 1
+                                    new_outers.append((it, jt, kt))
+                                    labels[it, jt, kt] = max_label
+                        outers = new_outers
+
+                    if blob_count >= min_cells:
+                        acceptable_blobs.append(max_label)
+
+    if min_cells > 0:
+        out_blobs = np.zeros_like(labels)
+        num_acceptable_blobs = 1
+        for blob_index in acceptable_blobs:
+            out_blobs[labels == blob_index] = num_acceptable_blobs
+            num_acceptable_blobs += 1
+
+        return out_blobs, num_acceptable_blobs
+    else:
+        return labels, max_label
+
+def label_halo(data, labels, nobjects, nlay=5, threshold=0.00001):
+    """
+    Function to set up the origin of halo region around cloud object for
+    backward and forward trajectories.
+
+    Args:
+        data           : data for object indicator
+        labels         : labels for cloud objects
+        nobjects       : cloud object IDs
+        nlay=5         : default number of layers from cloud edge for halo region
+        thresh=0.00001 : Cloud liquid water threshold for clouds.
+
+    Returns:
+        Halo labels around cloud objects::
+
+            halo_labels       : labels of original halo points at ref time,
+                                lables are the same as the corresponding object id
+            halo_dist_labels  : labels of original halo points, encoded with
+                                the distance information away from the cloud object
+            halo_logic_pos    : array of logical variable that marks the halo region
+
+    @author: Jian-Feng Gu
+
+    """
+
+    def _test_indices(i, j, diagonal=False, extended=False):
+        if extended:
+            # Count any cells in a 5x5 area centred on the current i, j cell as being adjacent.
+            indices = []
+            for ii in range(i - 2, i + 3):
+                for jj in range(j - 2, j + 3):
+                    indices.append((ii, jj))
+        else:
+            # Standard, cells sharing a border are adjacent.
+            indices = [(i-1, j), (i+1, j), (i, j-1), (i, j+1)]
+            if diagonal:
+                # Diagonal cells considered adjacent.
+                indices += [(i-1, j-1), (i-1, j+1), (i+1, j-1), (i+1, j+1)]
+        return indices
+
+    def grow(a, diagonal=False):
+        """
+        Grow original array by one cell.
+        
+        Args:
+            a        : input array.
+            diagonal : whether to grow in diagonal direction.
+        Return: 
+            new array that has been extended in each dir by one unit.
+        """
+        anew = a.copy()
+        for i, j in _test_indices(0, 0, diagonal):
+            anew |= np.roll(np.roll(a, i, axis=0), j, axis=1)
+        return anew
+
+
+    halo_labels = np.ones_like(labels)*(-1)
+    halo_dist_labels = np.zeros_like(labels)*1.0
+    halo_logic_pos = labels>-1
+
+    # cloud logic field
+    cld_logic = labels>-1
+    # extended cloud logic field for cloud halo
+    cld_extend_logic = cld_logic.copy()
+    # temporary cloud logic field
+    temp = cld_extend_logic.copy()
+    # now start labelling halo region for object iobj
+    for n in range(0,nlay):
+        # extend the cloud boundary
+        cld_extend_logic = grow(cld_extend_logic, diagonal=True)
+        # label the halo region every grid box away from the cloud boundary
+        layer = cld_extend_logic.copy()
+        layer[temp] = False
+        layer = np.logical_and(layer, data<threshold)
+        # label the halo region of object with the number of layers
+        halo_labels[layer] = n
+        # encode the distance of halo away from the cloud boundary
+        halo_dist_labels[layer] = np.exp(n+1)
+        temp = cld_extend_logic
+
+    halo_logic_pos = halo_labels>-1
+
+    return halo_labels, halo_dist_labels, halo_logic_pos
